@@ -1,67 +1,143 @@
 import dagger
 import anyio
+import argparse
+import os
+import re
 
-async def run_challenge(client, name, challenge_dir, port, solve_script, pip_deps=None):
-    """Build challenge, start it as a service, run the solve script."""
+
+def parse_port_from_dockerfile(dockerfile_path: str) -> int:
+    """Parse the first EXPOSE port from a Dockerfile."""
+    with open(dockerfile_path) as f:
+        for line in f:
+            m = re.match(r"^EXPOSE\s+(\d+)", line.strip())
+            if m:
+                return int(m.group(1))
+    raise ValueError(f"No EXPOSE directive found in {dockerfile_path}")
+
+
+def discover_challenges(ctf_path: str) -> list[dict]:
+    """Walk ctf_path and find all challenge directories.
+
+    A challenge directory must contain:
+      - Dockerfile
+      - solve.py
+      - flag.txt
+    """
+    challenges = []
+    for root, dirs, files in os.walk(ctf_path):
+        dirs.sort()
+        if {"Dockerfile", "solve.py", "flag.txt"}.issubset(files):
+            rel = os.path.relpath(root, ctf_path)
+            parts = rel.split(os.sep)
+            category = parts[0] if len(parts) > 1 else "misc"
+            name = parts[-1]
+            challenges.append(
+                {
+                    "label": f"[{category.upper():<6}] {name}",
+                    "category": category,
+                    "name": name,
+                    "path": root,
+                    "port": parse_port_from_dockerfile(
+                        os.path.join(root, "Dockerfile")
+                    ),
+                }
+            )
+    return challenges
+
+
+async def run_challenge(client: dagger.Client, challenge: dict) -> bool:
+    """Build the challenge service, run solve.py, compare output with flag.txt."""
+    label = challenge["label"]
+    path = challenge["path"]
+    port = challenge["port"]
+
+    # Expected flag
+    with open(os.path.join(path, "flag.txt")) as f:
+        expected_flag = f.read().strip()
+
+    challenge_dir = client.host().directory(path)
+
+    # Challenge runs as a Dagger service
     service = (
-        client.host().directory(challenge_dir)
-        .docker_build()
+        challenge_dir.docker_build()
         .with_exposed_port(port)
         .as_service()
     )
 
-    base = (
+    # Solver container — shares the same challenge directory
+    solver = (
         client.container()
-        .from_("python:3.11")
-        .with_directory("/solve", client.host().directory("./solve"))
+        .from_("python:3.11-slim")
+        .with_directory("/solve", challenge_dir)
         .with_workdir("/solve")
     )
 
-    if pip_deps:
-        base = base.with_exec(["pip", "install"] + pip_deps)
+    # Install solve dependencies if requirements.txt is present
+    if os.path.exists(os.path.join(path, "requirements.txt")):
+        solver = solver.with_exec(
+            ["pip", "install", "-r", "requirements.txt", "-q"]
+        )
 
-    solver = (
-        base
-        .with_service_binding("challenge", service)
-        .with_exec(["python", solve_script])
+    solver = solver.with_service_binding("challenge", service).with_exec(
+        ["python", "solve.py"]
     )
 
-    exit_code = await solver.exit_code()
-    if exit_code == 0:
-        print(f"  {name} validated")
-    else:
-        output = await solver.stderr()
-        print(f"  {name} failed\n{output}")
+    try:
+        output = await solver.stdout()
+        found_flag = output.strip()
+        if found_flag == expected_flag:
+            print(f"  ✅  {label}  →  {found_flag}")
+            return True
+        else:
+            print(f"  ❌  {label}")
+            print(f"       expected : {expected_flag}")
+            print(f"       got      : {found_flag}")
+            return False
+    except Exception:
+        stderr = await solver.stderr()
+        print(f"  💥  {label}  →  CRASH")
+        print(f"       {stderr.strip()}")
+        return False
 
-async def main():
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Automatically build, solve and validate CTF challenges with Dagger."
+    )
+    parser.add_argument(
+        "ctf_path",
+        nargs="?",
+        default="./challenges",
+        help="Path to the CTF folder (default: ./challenges)",
+    )
+    args = parser.parse_args()
+
+    ctf_path = os.path.abspath(args.ctf_path)
+    if not os.path.isdir(ctf_path):
+        print(f"Error: '{ctf_path}' is not a directory.")
+        return
+
+    challenges = discover_challenges(ctf_path)
+    if not challenges:
+        print(
+            f"No challenges found in '{ctf_path}'.\n"
+            "Each challenge directory must contain: Dockerfile, solve.py, flag.txt"
+        )
+        return
+
+    print(f"\n=== CTF Challenge Testing ===")
+    print(f"  Path  : {ctf_path}")
+    print(f"  Found : {len(challenges)} challenge(s)\n")
+
+    results = []
     async with dagger.Connection() as client:
-        print("\n=== CTF Challenge Testing ===\n")
+        for challenge in challenges:
+            ok = await run_challenge(client, challenge)
+            results.append(ok)
 
-        await run_challenge(
-            client,
-            name="[WEB]    chall1 - Flask admin bypass",
-            challenge_dir="./challenges/web/chall1",
-            port=5000,
-            solve_script="solve.py",
-            pip_deps=["requests"],
-        )
+    passed = sum(results)
+    total = len(results)
+    print(f"\n  {passed}/{total} challenge(s) passed.\n")
 
-        await run_challenge(
-            client,
-            name="[CRYPTO] chall1 - XOR cipher",
-            challenge_dir="./challenges/crypto/chall1",
-            port=5001,
-            solve_script="crypto_solve.py",
-        )
-
-        await run_challenge(
-            client,
-            name="[PWN]    chall1 - Buffer overflow",
-            challenge_dir="./challenges/pwn/chall1",
-            port=5002,
-            solve_script="pwn_solve.py",
-        )
-
-        print()
 
 anyio.run(main)
