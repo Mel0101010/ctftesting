@@ -10,9 +10,4 @@ s.close()
 hex_flag = data.split(": ")[1]
 flag = bytes([b ^ KEY for b in bytes.fromhex(hex_flag)]).decode()
 
-if "flag" in flag:
-    print("FLAG FOUND:", flag)
-    exit(0)
-
-print("FAILED:", flag)
-exit(1)
+print(flag)

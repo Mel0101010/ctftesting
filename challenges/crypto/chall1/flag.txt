@@ -1,0 +1,1 @@
+fakeflag{xor_is_not_crypto}
